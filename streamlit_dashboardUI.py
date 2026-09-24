@@ -141,7 +141,22 @@ def mock_model_metrics():
         "P": {"MAE": 3.05, "RMSE": 4.02, "R2": 0.88},
         "K": {"MAE": 5.44, "RMSE": 6.77, "R2": 0.89},
     }
+# ----------------------------------------------------------------------------
+# SESSION STATE INIT 
+"""from data_service import init_firebase, get_latest_reading, get_historical_readings, load_mlp_models, predict_nutrients, get_model_metrics
+import firebase_admin
 
+if not firebase_admin._apps:
+    init_firebase()
+
+if "reading" not in st.session_state:
+    st.session_state.reading = get_latest_reading()
+    st.session_state.models = load_mlp_models()
+    st.session_state.predictions = predict_nutrients(st.session_state.reading, st.session_state.models)
+    st.session_state.history = get_historical_readings()
+    st.session_state.metrics = get_model_metrics()
+    st.session_state.device_online = st.session_state.reading is not None"""
+# ----------------------------------------------------------------------------
 if "reading" not in st.session_state:
     st.session_state.reading = mock_current_reading()
     st.session_state.predictions = mock_predictions(st.session_state.reading)

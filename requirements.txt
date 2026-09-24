@@ -1,3 +1,6 @@
 streamlit
 pandas
 numpy
+firebase-admin
+joblib
+scikit-learn
