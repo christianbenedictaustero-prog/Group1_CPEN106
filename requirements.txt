@@ -4,3 +4,5 @@ numpy
 firebase-admin
 joblib
 scikit-learn
+firebase-admin
+protobuf>=6.33.5,<7.0.0
