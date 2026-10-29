@@ -100,47 +100,54 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ----------------------------------------------------------------------------
-# MOCK DATA (replace with Firebase RTDB reads + MLP model inference later)
+# LIVE DATA (Firebase RTDB + MLP inference)
+# Replace the whole "MOCK DATA" block in streamlit_dashboardUI.py with this,
+# and add `import data_service as ds` with the other imports at the top.
 # ----------------------------------------------------------------------------
-rng = np.random.default_rng(seed=42)
+import data_service as ds
 
-def mock_current_reading():
-    return {
-        "timestamp": datetime.now(),
-        "ec": round(rng.uniform(0.8, 2.4), 2),
-        "ph": round(rng.uniform(5.5, 7.5), 2),
-        "soil_humidity": round(rng.uniform(25, 65), 1),
-        "soil_temp": round(rng.uniform(22, 33), 1),
-        "n_actual": round(rng.uniform(20, 120), 1),
-        "p_actual": round(rng.uniform(10, 60), 1),
-        "k_actual": round(rng.uniform(15, 90), 1),
-    }
 
-def mock_predictions(reading):
-    noise = lambda v: round(v + rng.normal(0, v * 0.06), 1)
-    return {
-        "n_pred": noise(reading["n_actual"]),
-        "p_pred": noise(reading["p_actual"]),
-        "k_pred": noise(reading["k_actual"]),
-    }
+@st.cache_resource
+def _backend():
+    """Connect to Firebase once and load the models once."""
+    try:
+        ds.init_firebase()
+    except Exception as e:
+        st.error(f"Could not connect to Firebase: {e}")
+        st.stop()
+    return ds.load_mlp_models()        # None until the model files exist
 
-def mock_history(hours=24):
-    now = datetime.now()
-    times = [now - timedelta(minutes=15 * i) for i in range(hours * 4)][::-1]
-    df = pd.DataFrame({
-        "timestamp": times,
-        "N (mg/kg)": np.clip(60 + np.cumsum(rng.normal(0, 3, len(times))), 10, 140),
-        "P (mg/kg)": np.clip(35 + np.cumsum(rng.normal(0, 2, len(times))), 5, 80),
-        "K (mg/kg)": np.clip(50 + np.cumsum(rng.normal(0, 2.5, len(times))), 10, 110),
-    })
-    return df
 
-def mock_model_metrics():
-    return {
-        "N": {"MAE": 4.82, "RMSE": 6.13, "R2": 0.91},
-        "P": {"MAE": 3.05, "RMSE": 4.02, "R2": 0.88},
-        "K": {"MAE": 5.44, "RMSE": 6.77, "R2": 0.89},
-    }
+_models = _backend()
+
+
+def get_current_reading():
+    reading = ds.get_latest_reading()
+    if reading is None:
+        st.warning("No readings found in the database yet.")
+        st.stop()
+    return reading
+
+
+def get_predictions(reading):
+    return ds.predict_nutrients(reading, _models)
+
+
+@st.cache_data(ttl=30)
+def get_history(hours=24):
+    return ds.get_historical_readings(hours)
+
+
+def get_metrics():
+    return ds.get_model_metrics()
+
+
+# Aliases so the rest of the UI keeps working unchanged.
+# Rename the call sites to the get_* names later and delete these.
+mock_current_reading = get_current_reading
+mock_predictions = get_predictions
+mock_history = get_history
+mock_model_metrics = get_metrics
 # ----------------------------------------------------------------------------
 # SESSION STATE INIT 
 """from data_service import init_firebase, get_latest_reading, get_historical_readings, load_mlp_models, predict_nutrients, get_model_metrics

@@ -2,42 +2,33 @@
 data_service.py
 Real data layer for the NPK Monitoring Dashboard.
 
-This file replaces the mock_* functions in streamlit_dashboardUI.py with
-real reads from Firebase Realtime Database and real MLP model inference.
-The UI file itself does not need to change -- only the calls that
-populate st.session_state.
+Reads live sensor data from Firebase Realtime Database and runs the three
+MLP models. It replaces the mock_* functions in streamlit_dashboardUI.py.
 
 --------------------------------------------------------------------------
-FIREBASE SCHEMA ASSUMED (adjust the paths/keys below to match yours):
+FIREBASE SCHEMA (matches the Firebase setup guide):
 
-/sensor_readings/
-    -Nxxxxxx1: {timestamp, ec, ph, soil_humidity, soil_temp, n, p, k}
-    -Nxxxxxx2: {timestamp, ec, ph, soil_humidity, soil_temp, n, p, k}
-    ...
+/latest/{device_id}            newest reading (overwritten by the ESP32)
+/readings/{device_id}/{key}    full history, one child per reading
 
-Each push under /sensor_readings is one ESP32 HTTP POST. If your ESP32
-instead writes to a single fixed path (e.g. /latest_reading), use
-get_latest_reading_single() instead of get_latest_reading().
+Each reading has:
+    timestamp (Unix seconds), date, time,
+    electrical_conductivity_dS_m, soil_pH, soil_humidity_pct,
+    soil_temperature_C, nitrogen_mg_kg, phosphorus_mg_kg,
+    potassium_mg_kg, valid (True when soil moisture >= ~25 %)
 
-/model_metrics/  (optional, written once after training/evaluation)
-    N: {MAE, RMSE, R2}
-    P: {MAE, RMSE, R2}
-    K: {MAE, RMSE, R2}
-
-If you don't write metrics to Firebase, just hard-code them from your
-training notebook results using get_model_metrics_static() instead.
+/model_metrics/{N|P|K}         optional: {MAE, RMSE, R2} written after training
 --------------------------------------------------------------------------
 
 SETUP:
     pip install firebase-admin joblib scikit-learn pandas numpy
 
-    1. In Firebase console -> Project Settings -> Service Accounts ->
-       "Generate new private key". Save the JSON file, e.g. as
-       "serviceAccountKey.json" (do NOT commit this to git / share it).
-    2. Set FIREBASE_DB_URL below to your Realtime Database URL, e.g.
-       "https://your-project-id-default-rtdb.asia-southeast1.firebasedatabase.app/"
-    3. Put your three trained model files (and any scaler) in a
-       "models/" folder next to this script.
+    - Keep serviceAccountKey.json OUT of git (it is in .gitignore).
+    - Locally the key is read from SERVICE_ACCOUNT_PATH, or from the
+      FIREBASE_KEY_PATH environment variable if you keep it elsewhere.
+    - On a deployed Streamlit app, put the key in the app's secrets under a
+      [firebase] table instead of a file.
+    - Put the trained models in a "models/" folder next to this file.
 """
 
 import os
@@ -50,118 +41,63 @@ import firebase_admin
 from firebase_admin import credentials, db
 
 # ============================================================================
-# CONFIG -- edit these to match your project
+# CONFIG
 # ============================================================================
-SERVICE_ACCOUNT_PATH = "serviceAccountKey.json"
-FIREBASE_DB_URL = "https://YOUR-PROJECT-ID-default-rtdb.asia-southeast1.firebasedatabase.app/"
-READINGS_PATH = "sensor_readings"   # RTDB node the ESP32 pushes new readings to
-METRICS_PATH = "model_metrics"      # optional RTDB node for pre-computed metrics
+DEVICE_ID = "device01"
+FIREBASE_DB_URL = "https://soil-monitoring-system-db-default-rtdb.firebaseio.com"
+SERVICE_ACCOUNT_PATH = os.environ.get("FIREBASE_KEY_PATH", "serviceAccountKey.json")
+
+LATEST_PATH = f"latest/{DEVICE_ID}"
+READINGS_PATH = f"readings/{DEVICE_ID}"
+METRICS_PATH = "model_metrics"
+
+MIN_VALID_MOISTURE = 25.0   # % soil moisture below which NPK readings are unreliable
 
 MODEL_DIR = "models"
-MODEL_FILES = {
-    "N": "n_model.pkl",
-    "P": "p_model.pkl",
-    "K": "k_model.pkl",
-}
-SCALER_FILE = "scaler.pkl"   # set to None if your models don't need one
+MODEL_FILES = {"N": "n_model.pkl", "P": "p_model.pkl", "K": "k_model.pkl"}
+# Each model has different input columns, so each needs its OWN scaler.
+# If a scaler file does not exist, that model gets unscaled input.
+SCALER_FILES = {"N": "n_scaler.pkl", "P": "p_scaler.pkl", "K": "k_scaler.pkl"}
+
+NAN_PREDICTIONS = {"n_pred": float("nan"), "p_pred": float("nan"), "k_pred": float("nan")}
 
 
 # ============================================================================
-# FIREBASE CONNECTION FUNCTIONS
+# FIREBASE CONNECTION
 # ============================================================================
+
+def _load_credentials():
+    """Use Streamlit secrets ([firebase] table) if present, else the key file."""
+    try:
+        import streamlit as st
+        if "firebase" in st.secrets:
+            return credentials.Certificate(dict(st.secrets["firebase"]))
+    except Exception:
+        pass
+    return credentials.Certificate(SERVICE_ACCOUNT_PATH)
+
 
 def init_firebase():
-    """
-    Initialize the Firebase Admin SDK connection to your Realtime Database.
-    Call this once, e.g. at the top of app.py, guarded so it only runs once
-    per Streamlit session:
-
-        if not firebase_admin._apps:
-            init_firebase()
-    """
-    cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
-    firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
+    """Connect to Firebase once. Safe to call more than once."""
+    if firebase_admin._apps:
+        return
+    firebase_admin.initialize_app(_load_credentials(), {"databaseURL": FIREBASE_DB_URL})
 
 
-def get_latest_reading():
-    """
-    Fetch the most recent sensor reading from /sensor_readings, where each
-    child was created with push() (auto-generated keys, which sort
-    chronologically). Returns a dict shaped like the old mock_current_reading().
-    """
-    ref = db.reference(READINGS_PATH)
-    latest = ref.order_by_key().limit_to_last(1).get()
+# ============================================================================
+# READING DATA
+# ============================================================================
 
-    if not latest:
-        return None
-
-    _, entry = next(iter(latest.items()))
-    return _normalize_reading(entry)
-
-
-def get_latest_reading_single(path="latest_reading"):
-    """
-    Alternative to get_latest_reading(): use this if your ESP32 overwrites
-    one fixed node (e.g. /latest_reading) instead of push()-ing new children.
-    """
-    ref = db.reference(path)
-    entry = ref.get()
-    if not entry:
-        return None
-    return _normalize_reading(entry)
-
-
-def get_historical_readings(hours=24):
-    """
-    Fetch readings from the last `hours` hours as a DataFrame with columns:
-    timestamp, N (mg/kg), P (mg/kg), K (mg/kg)  -- matches what
-    streamlit_dashboardUI.py's Historical Trends page expects from
-    mock_history().
-
-    Assumes each child has a numeric/epoch "timestamp" field. If your ESP32
-    stores timestamps as ISO strings instead, adjust the parsing below.
-    """
-    ref = db.reference(READINGS_PATH)
-    cutoff = datetime.now() - timedelta(hours=hours)
-    cutoff_epoch = cutoff.timestamp()
-
-    all_readings = ref.order_by_child("timestamp").start_at(cutoff_epoch).get()
-    if not all_readings:
-        return pd.DataFrame(columns=["timestamp", "N (mg/kg)", "P (mg/kg)", "K (mg/kg)"])
-
-    rows = []
-    for _, entry in all_readings.items():
-        norm = _normalize_reading(entry)
-        rows.append({
-            "timestamp": norm["timestamp"],
-            "N (mg/kg)": norm["n_actual"],
-            "P (mg/kg)": norm["p_actual"],
-            "K (mg/kg)": norm["k_actual"],
-        })
-
-    df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
-    return df
-
-
-def get_model_metrics():
-    """
-    Fetch pre-computed MAE/RMSE/R2 per nutrient from Firebase, if you chose
-    to write them there after training. Returns the same shape as the old
-    mock_model_metrics(): {"N": {...}, "P": {...}, "K": {...}}.
-    """
-    ref = db.reference(METRICS_PATH)
-    data = ref.get()
-    if not data:
-        return get_model_metrics_static()
-    return data
+def _num(value):
+    """Convert to float, or NaN if the value is missing or not a number."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
 
 
 def _normalize_reading(entry):
-    """
-    Internal helper: converts a raw Firebase entry into the dict shape the
-    dashboard's session_state expects. Adjust the key names on the left if
-    your ESP32 payload uses different field names (e.g. "N" vs "n").
-    """
+    """Convert a raw Firebase record into the dict the dashboard expects."""
     ts_raw = entry.get("timestamp")
     if isinstance(ts_raw, (int, float)):
         timestamp = datetime.fromtimestamp(ts_raw)
@@ -170,61 +106,123 @@ def _normalize_reading(entry):
     else:
         timestamp = datetime.now()
 
+    humidity = _num(entry.get("soil_humidity_pct"))
+    valid = entry.get("valid")
+    if valid is None:                       # older records without the flag
+        valid = humidity >= MIN_VALID_MOISTURE
+
     return {
         "timestamp": timestamp,
-        "ec": float(entry.get("ec", 0)),
-        "ph": float(entry.get("ph", 0)),
-        "soil_humidity": float(entry.get("soil_humidity", 0)),
-        "soil_temp": float(entry.get("soil_temp", 0)),
-        "n_actual": float(entry.get("n", 0)),
-        "p_actual": float(entry.get("p", 0)),
-        "k_actual": float(entry.get("k", 0)),
+        "ec": _num(entry.get("electrical_conductivity_dS_m")),
+        "ph": _num(entry.get("soil_pH")),
+        "soil_humidity": humidity,
+        "soil_temp": _num(entry.get("soil_temperature_C")),
+        "n_actual": _num(entry.get("nitrogen_mg_kg")),
+        "p_actual": _num(entry.get("phosphorus_mg_kg")),
+        "k_actual": _num(entry.get("potassium_mg_kg")),
+        "valid": bool(valid),
+    }
+
+
+def get_latest_reading():
+    """Newest reading as a dict, or None if the database has no readings."""
+    entry = db.reference(LATEST_PATH).get()
+    if not entry:                           # fall back to the newest history record
+        newest = (db.reference(READINGS_PATH)
+                  .order_by_child("timestamp").limit_to_last(1).get())
+        if not newest:
+            return None
+        entry = next(iter(newest.values()))
+    return _normalize_reading(entry)
+
+
+def get_historical_readings(hours=24, include_invalid=False):
+    """
+    Readings from the last `hours` hours as a DataFrame with columns
+    timestamp, N (mg/kg), P (mg/kg), K (mg/kg). Readings flagged
+    valid = False (low moisture) are left out unless include_invalid=True.
+    """
+    columns = ["timestamp", "N (mg/kg)", "P (mg/kg)", "K (mg/kg)"]
+    cutoff_epoch = (datetime.now() - timedelta(hours=hours)).timestamp()
+
+    data = (db.reference(READINGS_PATH)
+            .order_by_child("timestamp").start_at(cutoff_epoch).get())
+    if not data:
+        return pd.DataFrame(columns=columns)
+
+    rows = []
+    for entry in data.values():
+        r = _normalize_reading(entry)
+        if not include_invalid and not r["valid"]:
+            continue
+        rows.append({
+            "timestamp": r["timestamp"],
+            "N (mg/kg)": r["n_actual"],
+            "P (mg/kg)": r["p_actual"],
+            "K (mg/kg)": r["k_actual"],
+        })
+
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+
+
+def get_model_metrics():
+    """MAE / RMSE / R2 per nutrient from Firebase, or the static fallback."""
+    data = db.reference(METRICS_PATH).get()
+    return data if data else get_model_metrics_static()
+
+
+def get_model_metrics_static():
+    """
+    TODO: replace the NaN values with the MAE, RMSE and R2 from your
+    training notebook (80/20 test split). NaN means "not filled in yet".
+    """
+    nan = float("nan")
+    return {
+        "N": {"MAE": nan, "RMSE": nan, "R2": nan},
+        "P": {"MAE": nan, "RMSE": nan, "R2": nan},
+        "K": {"MAE": nan, "RMSE": nan, "R2": nan},
     }
 
 
 # ============================================================================
-# MODEL INFERENCE FUNCTIONS (MLP predictions, run locally after Firebase read)
+# MLP INFERENCE
 # ============================================================================
 
 def load_mlp_models():
     """
-    Load the three trained MLP regression models (one per nutrient) plus an
-    optional shared feature scaler. Call once and cache the result, e.g. in
-    app.py with:
-
-        @st.cache_resource
-        def get_models():
-            return load_mlp_models()
+    Load the three trained models (and optional scalers) from MODEL_DIR.
+    Returns None if the model files do not exist yet, so the dashboard can
+    still run with live sensor data before the models are trained.
     """
-    models = {}
+    models, scalers = {}, {}
     for nutrient, filename in MODEL_FILES.items():
         path = os.path.join(MODEL_DIR, filename)
+        if not os.path.exists(path):
+            return None
         models[nutrient] = joblib.load(path)
 
-    scaler = None
-    if SCALER_FILE:
-        scaler_path = os.path.join(MODEL_DIR, SCALER_FILE)
-        if os.path.exists(scaler_path):
-            scaler = joblib.load(scaler_path)
-
-    return {"models": models, "scaler": scaler}
+        scaler_path = os.path.join(MODEL_DIR, SCALER_FILES[nutrient])
+        scalers[nutrient] = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
+    return {"models": models, "scalers": scalers}
 
 
 def predict_nutrients(reading, model_bundle):
     """
-    Run the three MLP models on one sensor reading. Each model predicts one
-    macronutrient using the other six parameters as inputs (EC, pH, soil
-    humidity, soil temp, and the two other macronutrients), per the
-    capstone's design.
+    Predict N, P and K for one reading. Each model uses the other six
+    parameters as inputs. Returns NaN predictions when the models are not
+    loaded, the reading is flagged invalid (soil moisture below the
+    threshold), or any input is missing.
 
-    Returns a dict shaped like the old mock_predictions():
-    {"n_pred": ..., "p_pred": ..., "k_pred": ...}
+    IMPORTANT: the order of the input columns below must match the column
+    order used when each model was trained. A different order will give
+    wrong predictions without any error.
     """
-    models = model_bundle["models"]
-    scaler = model_bundle.get("scaler")
+    if model_bundle is None or not reading.get("valid", True):
+        return dict(NAN_PREDICTIONS)
 
     base = [reading["ec"], reading["ph"], reading["soil_humidity"], reading["soil_temp"]]
-
     feature_sets = {
         "N": base + [reading["p_actual"], reading["k_actual"]],
         "P": base + [reading["n_actual"], reading["k_actual"]],
@@ -233,23 +231,12 @@ def predict_nutrients(reading, model_bundle):
 
     predictions = {}
     for nutrient, features in feature_sets.items():
-        X = np.array(features).reshape(1, -1)
+        if np.isnan(features).any():
+            return dict(NAN_PREDICTIONS)
+        X = np.array(features, dtype=float).reshape(1, -1)
+        scaler = model_bundle["scalers"].get(nutrient)
         if scaler is not None:
             X = scaler.transform(X)
-        pred = models[nutrient].predict(X)[0]
+        pred = model_bundle["models"][nutrient].predict(X)[0]
         predictions[nutrient.lower() + "_pred"] = round(float(pred), 1)
-
     return predictions
-
-
-def get_model_metrics_static():
-    """
-    Fallback if you don't write metrics to Firebase: hard-code the MAE,
-    RMSE, and R2 you got when evaluating each model on the 80/20 test
-    split, straight from your training notebook.
-    """
-    return {
-        "N": {"MAE": 0.0, "RMSE": 0.0, "R2": 0.0},
-        "P": {"MAE": 0.0, "RMSE": 0.0, "R2": 0.0},
-        "K": {"MAE": 0.0, "RMSE": 0.0, "R2": 0.0},
-    }
